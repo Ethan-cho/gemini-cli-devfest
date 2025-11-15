@@ -4,4 +4,4 @@ API-KEY.dat
 .venv/
 venv/
 __pycache__/
-*.pyc
+*.pyc.gemini/.env

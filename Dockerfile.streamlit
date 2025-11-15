@@ -1,0 +1,22 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# 필수 시스템 패키지(폰트, 빌드툴 등 필요하면 여기 추가)
+RUN apt-get update && apt-get install -y \ 
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python 패키지 설치
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 앱 소스 복사
+COPY . .
+
+# Streamlit이 사용할 포트
+EXPOSE 8080
+ENV PORT=8080
+
+# Streamlit 실행 커맨드
+CMD ["streamlit", "run", "app.py", "--server.port=8080", "--server.address=0.0.0.0"]

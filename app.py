@@ -4,179 +4,183 @@ import requests
 import xml.etree.ElementTree as ET
 import datetime
 import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+import os
+from dotenv import load_dotenv
+import time
 
-# 한글 폰트 설정
-plt.rcParams['font.family'] = 'NanumGothic'
-plt.rcParams['axes.unicode_minus'] = False
+# --- Matplotlib 한글 폰트 설정 (최종 제안된 방식) ---
+FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+    "/usr/share/fonts/truetype/nanum/NanumGothic-Regular.ttf",
+    "/usr/share/fonts/truetype/nanum/NanumGothicCoding.ttf",
+    "/usr/share/fonts/truetype/nanum/NanumMyeongjo.ttf",
+]
 
+font_found = False
+for path in FONT_CANDIDATES:
+    if os.path.exists(path):
+        fm.fontManager.addfont(path)
+        prop = fm.FontProperties(fname=path)
+        plt.rcParams["font.family"] = prop.get_name()
+        font_found = True
+        break
+
+if not font_found:
+    print("⚠️ 한글 폰트를 찾지 못했습니다.")
+plt.rcParams["axes.unicode_minus"] = False
+
+# .env 파일에서 환경 변수 로드
+load_dotenv()
 
 # Streamlit 앱 페이지 설정
 st.set_page_config(page_title="국토교통부 실거래가 조회 서비스", layout="wide")
 
-# Streamlit 앱 제목 설정
+# --- 함수 정의 ---
+@st.cache_data(ttl=3600)
+def get_api_data(service_key, lawd_cd, deal_ymd):
+    endpoint = "https://apis.data.go.kr/1613000/RTMSDataSvcAptTrade/getRTMSDataSvcAptTrade"
+    params = {"serviceKey": service_key, "LAWD_CD": lawd_cd, "DEAL_YMD": deal_ymd, "pageNo": "1", "numOfRows": "1000"}
+    try:
+        response = requests.get(endpoint, params=params, timeout=30)
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+        if root.findtext("header/resultCode") not in ('00', '000'): return None
+        items = [ {child.tag: (child.text or "").strip() for child in item} for item in root.findall(".//item") ]
+        return pd.DataFrame(items) if items else None
+    except (requests.exceptions.RequestException, ET.ParseError):
+        return None
+
+def format_price(price_in_man):
+    eok = int(price_in_man // 10000)
+    man = int(price_in_man % 10000)
+    if eok > 0 and man > 0: return f"{eok}억 {man: ,}만원"
+    elif eok > 0: return f"{eok}억"
+    else: return f"{man: ,}만원"
+
+def to_pyeong(area_sqm):
+    return area_sqm * 0.3025
+
+# --- 세션 상태 초기화 ---
+if 'show_results' not in st.session_state: st.session_state.show_results = False
+if 'df' not in st.session_state: st.session_state.df = None
+
+# --- UI 구성 ---
 st.title('국토교통부 아파트 실거래가 조회 서비스')
 st.caption("국토교통부 실거래가 공개 API를 이용하여 아파트 실거래가 정보를 조회합니다.")
 
-
-# --- 함수 정의 ---
-
-@st.cache_data
-def get_api_data(service_key, lawd_cd, deal_ymd):
-    """국토교통부 실거래가 API를 호출하여 데이터를 가져오는 함수"""
-    
-    # API 엔드포인트 및 파라미터 설정
-    endpoint = "http://apis.data.go.kr/1613000/RTMSDataSvcAptTradeDev/getRTMSDataSvcAptTradeDev"
-    params = {
-        'serviceKey': service_key,
-        'LAWD_CD': lawd_cd,
-        'DEAL_YMD': deal_ymd,
-        'numOfRows': '1000' # 한 번에 1000개까지 가져오도록 설정
-    }
-    
-    try:
-        response = requests.get(endpoint, params=params)
-        response.raise_for_status() # HTTP 오류 발생 시 예외 발생
-        
-        # XML 응답 파싱
-        root = ET.fromstring(response.content)
-        
-        # 결과 코드가 정상이 아닌 경우
-        result_code = root.find('header/resultCode').text
-        if result_code != '00':
-            result_msg = root.find('header/resultMsg').text
-            st.error(f"API 호출 실패: {result_msg} (코드: {result_code})")
-            return None
-            
-        # item들을 DataFrame으로 변환
-        items = []
-        for item in root.findall('body/items/item'):
-            item_data = {child.tag: child.text for child in item}
-            items.append(item_data)
-            
-        if not items:
-            st.warning("해당 조건에 맞는 데이터가 없습니다.")
-            return None
-            
-        df = pd.DataFrame(items)
-        return df
-        
-    except requests.exceptions.RequestException as e:
-        st.error(f"API 요청 중 오류가 발생했습니다: {e}")
-        return None
-    except ET.ParseError as e:
-        st.error(f"XML 파싱 중 오류가 발생했습니다. API 응답을 확인해주세요: {e}")
-        st.text(response.text) # 실제 응답 내용 출력
-        return None
-
-
-# --- Streamlit UI 구성 ---
-
-# 사용자 입력 필드 (사이드바)
 with st.sidebar:
     st.header("조회 조건 입력")
-    service_key_input = st.text_input("API 서비스 키", type="password", help="공공데이터포털에서 발급받은 API 서비스 키를 입력하세요.")
+    service_key_input = os.getenv("DATA_API_KEY") or st.text_input("API 서비스 키", type="password")
+    if os.getenv("DATA_API_KEY"): st.success("API 키를 성공적으로 로드했습니다.")
+    
+    lawd_cd_options = {"강남구": "11680", "서초구": "11650", "송파구": "11710", "용산구": "11170", "성동구": "11200", "마포구": "11440", "성남시 분당구": "41135", "성남시 수정구": "41131", "성남시 중원구": "41133"}
+    selected_district_name = st.selectbox("지역(구) 선택", list(lawd_cd_options.keys()))
+    lawd_cd_input = lawd_cd_options[selected_district_name]
 
-    # 법정동 코드 예시 (자주 사용하는 지역)
-    lawd_cd_options = {
-        "강남구": "11680",
-        "서초구": "11650",
-        "송파구": "11710",
-        "용산구": "11170",
-        "성동구": "11200",
-        "마포구": "11440"
-    }
-    selected_district_name = st.selectbox("지역(구) 선택", ["직접 입력"] + list(lawd_cd_options.keys()))
+    current_year = datetime.datetime.now().year
+    selected_year = st.number_input("조회 년도", min_value=2006, max_value=current_year, value=2025)
+    selected_month = st.selectbox("조회 월", list(range(1, 13)), index=9)
+    deal_ymd_input = f"{selected_year}{selected_month:02d}"
 
-    if selected_district_name == "직접 입력":
-        lawd_cd_input = st.text_input("법정동 코드 5자리", placeholder="예: 11680")
-        st.markdown("[법정동 코드 검색 (외부 링크)](https://www.code.go.kr/stdcode/regCodeL.do)")
-    else:
-        lawd_cd_input = lawd_cd_options[selected_district_name]
+    if st.button('실거래가 조회', type="primary"):
+        if not service_key_input: st.warning("API 서비스 키를 입력해주세요.")
+        else:
+            with st.spinner('데이터를 가져오는 중입니다...'):
+                st.session_state.df = get_api_data(service_key_input, lawd_cd_input, deal_ymd_input)
+            st.session_state.show_results = True
 
-    deal_date = st.date_input("계약년월 선택", datetime.date(2023, 10))
-    deal_ymd_input = deal_date.strftime("%Y%m")
+# --- 메인 화면 로직 ---
+if st.session_state.show_results:
+    df = st.session_state.df
+    if df is not None:
+        st.success(f"**{selected_district_name}**의 **{deal_ymd_input[:4]}년 {deal_ymd_input[4:]}월** 실거래가 정보입니다.")
+        
+        try:
+            display_columns = {'aptNm': '아파트', 'umdNm': '법정동', 'dealAmount': '거래금액(만원)', 'excluUseAr': '전용면적(㎡)', 'floor': '층', 'buildYear': '건축년도', 'dealYear': '거래년', 'dealMonth': '거래월', 'dealDay': '거래일'}
+            df_display = df[list(display_columns.keys())].copy()
+            df_display.rename(columns=display_columns, inplace=True)
 
-    search_button = st.button('실거래가 조회', type="primary")
+            for col in ['전용면적(㎡)', '층', '건축년도']: df_display[col] = pd.to_numeric(df_display[col], errors='coerce')
+            df_display['거래금액(만원)'] = df_display['거래금액(만원)'].str.replace(',', '').str.strip().astype(int)
 
-
-# 메인 화면
-if search_button:
-    if not service_key_input:
-        st.warning("API 서비스 키를 입력해주세요.")
-    elif not lawd_cd_input:
-        st.warning("법정동 코드를 입력해주세요.")
-    else:
-        with st.spinner('데이터를 가져오는 중입니다...'):
-            # API 호출
-            df = get_api_data(service_key_input, lawd_cd_input, deal_ymd_input)
-            
-            if df is not None:
-                display_district_name = selected_district_name if selected_district_name != "직접 입력" else f"코드: {lawd_cd_input}"
-                st.success(f"**{display_district_name}**의 **{deal_ymd_input[:4]}년 {deal_ymd_input[4:]}월** 실거래가 정보입니다.")
+            tab1, tab2 = st.tabs(["데이터 표", "요약 및 시각화"])
+            with tab1: st.dataframe(df_display)
+            with tab2:
+                st.subheader("요약 통계")
+                max_price_row = df_display.loc[df_display['거래금액(만원)'].idxmax()]
+                min_price_row = df_display.loc[df_display['거래금액(만원)'].idxmin()]
                 
-                # 데이터 전처리 및 표시
-                try:
-                    # 필요한 컬럼 선택 및 이름 변경
-                    display_columns = {
-                        '아파트': '아파트', '법정동': '법정동', '거래금액': '거래금액(만원)',
-                        '전용면적': '전용면적(㎡)', '층': '층', '건축년도': '건축년도',
-                        '년': '거래년', '월': '거래월', '일': '거래일'
-                    }
-                    df_display = df[list(display_columns.keys())].copy()
-                    df_display.rename(columns=display_columns, inplace=True)
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("총 거래 건수", f"{len(df_display)} 건")
+                col2.metric("평균 거래가", format_price(df_display['거래금액(만원)'].mean()))
+                col3.metric("최고 거래가", format_price(df_display['거래금액(만원)'].max()))
+                col4.metric("최저 거래가", format_price(df_display['거래금액(만원)'].min()))
+                
+                st.divider()
+                st.write("##### 주요 거래 정보")
+                col1, col2 = st.columns(2)
+                with col1: st.info(f"**최고가 아파트:** {max_price_row['아파트']}  \n**거래 금액:** {format_price(max_price_row['거래금액(만원)'])}  \n**전용 면적:** {max_price_row['전용면적(㎡)']} ㎡ ({to_pyeong(max_price_row['전용면적(㎡)']):.2f} 평)")
+                with col2: st.info(f"**최저가 아파트:** {min_price_row['아파트']}  \n**거래 금액:** {format_price(min_price_row['거래금액(만원)'])}  \n**전용 면적:** {min_price_row['전용면적(㎡)']} ㎡ ({to_pyeong(min_price_row['전용면적(㎡)']):.2f} 평)")
+                
+                st.divider()
+                st.subheader("시각화")
+                st.write("#### 거래금액 분포 (히스토그램)")
+                fig, ax = plt.subplots()
+                ax.hist(df_display['거래금액(만원)'], bins=30, edgecolor='black')
+                ax.set_xlabel("거래금액 (만원)")
+                ax.set_ylabel("거래 건수")
+                st.pyplot(fig)
+                
+                st.write("#### 전용면적 대비 거래금액 (산점도)")
+                fig, ax = plt.subplots()
+                ax.scatter(df_display['전용면적(㎡)'], df_display['거래금액(만원)'], alpha=0.5)
+                ax.set_xlabel("전용면적 (㎡)")
+                ax.set_ylabel("거래금액 (만원)")
+                ax.grid(True)
+                st.pyplot(fig)
+            
+            st.divider()
+            st.subheader("아파트별 최근 3년 시세 조회")
+            unique_apts = sorted(df_display['아파트'].unique())
+            selected_apt = st.selectbox("시세를 조회할 아파트를 선택하세요.", options=[""] + unique_apts)
 
-                    # 데이터 타입 변환
-                    numeric_cols = ['전용면적(㎡)', '층', '건축년도']
-                    for col in numeric_cols:
-                        df_display[col] = pd.to_numeric(df_display[col], errors='coerce')
-                    
-                    df_display['거래금액(만원)'] = df_display['거래금액(만원)'].str.replace(',', '').str.strip().astype(int)
+            if selected_apt:
+                all_dfs = []
+                progress_bar = st.progress(0, text="과거 데이터 조회 중...")
+                with st.spinner(f"'{selected_apt}'의 최근 3년치 데이터를 가져오는 중..."):
+                    for i in range(36):
+                        target_date = datetime.date(selected_year, selected_month, 1) - pd.DateOffset(months=i)
+                        yyyymm = target_date.strftime("%Y%m")
+                        monthly_df = get_api_data(service_key_input, lawd_cd_input, yyyymm)
+                        if monthly_df is not None: all_dfs.append(monthly_df)
+                        progress_bar.progress((i + 1) / 36, text=f"{yyyymm} 데이터 조회 완료")
+                        time.sleep(0.1)
+                progress_bar.empty()
 
-                    # 결과 표시를 위한 탭 생성
-                    tab1, tab2 = st.tabs(["데이터 표", "요약 및 시각화"])
+                if all_dfs:
+                    history_df = pd.concat(all_dfs, ignore_index=True)
+                    apt_history_df = history_df[history_df['aptNm'] == selected_apt].copy()
+                    if not apt_history_df.empty:
+                        apt_history_df['거래일'] = pd.to_datetime(apt_history_df['dealYear'] + '-' + apt_history_df['dealMonth'] + '-' + apt_history_df['dealDay'])
+                        apt_history_df['dealAmount'] = apt_history_df['dealAmount'].str.replace(',', '').str.strip().astype(int)
+                        apt_history_df.sort_values('거래일', inplace=True)
 
-                    with tab1:
-                        st.dataframe(df_display)
-
-                    with tab2:
-                        st.subheader("기본 통계")
-                        
-                        # 거래 건수, 평균/최고/최저가 표시
-                        total_deals = len(df_display)
-                        avg_price = df_display['거래금액(만원)'].mean()
-                        max_price = df_display['거래금액(만원)'].max()
-                        min_price = df_display['거래금액(만원)'].min()
-                        
-                        col1, col2, col3, col4 = st.columns(4)
-                        col1.metric("총 거래 건수", f"{total_deals} 건")
-                        col2.metric("평균 거래가", f"{avg_price:,.0f} 만원")
-                        col3.metric("최고 거래가", f"{max_price:,.0f} 만원")
-                        col4.metric("최저 거래가", f"{min_price:,.0f} 만원")
-                        
-                        st.divider()
-                        
-                        st.subheader("시각화")
-                        
-                        # 거래금액 분포 히스토그램
-                        st.write("#### 거래금액 분포 (히스토그램)")
-                        fig, ax = plt.subplots()
-                        ax.hist(df_display['거래금액(만원)'], bins=30, edgecolor='black')
-                        ax.set_xlabel("거래금액 (만원)")
-                        ax.set_ylabel("거래 건수")
-                        st.pyplot(fig)
-                        
-                        # 전용면적 대비 거래금액 산점도
-                        st.write("#### 전용면적 대비 거래금액 (산점도)")
-                        fig, ax = plt.subplots()
-                        ax.scatter(df_display['전용면적(㎡)'], df_display['거래금액(만원)'], alpha=0.5)
-                        ax.set_xlabel("전용면적 (㎡)")
+                        st.write(f"#### '{selected_apt}' 최근 3년 실거래가 추이")
+                        fig, ax = plt.subplots(figsize=(12, 6))
+                        ax.plot(apt_history_df['거래일'], apt_history_df['dealAmount'], marker='o', linestyle='-')
+                        ax.set_xlabel("거래일")
                         ax.set_ylabel("거래금액 (만원)")
+                        ax.set_title(f"{selected_apt} 시세 추이")
                         ax.grid(True)
+                        plt.xticks(rotation=45)
                         st.pyplot(fig)
+                    else: st.warning(f"'{selected_apt}'에 대한 지난 3년간의 데이터가 없습니다.")
+                else: st.warning(f"'{selected_apt}'에 대한 지난 3년간의 데이터가 없습니다.")
 
-                except KeyError as e:
-                    st.error(f"데이터 처리 중 오류가 발생했습니다. 필요한 컬럼({e})이 응답에 없습니다.")
-                    st.dataframe(df) # 원본 데이터프레임 출력
-                except Exception as e:
-                    st.error(f"데이터를 처리하는 도중 오류가 발생했습니다: {e}")
-                    st.dataframe(df) # 원본 데이터프레임 출력
+        except Exception as e:
+            st.error(f"데이터를 처리하는 도중 오류가 발생했습니다: {e}")
+    else:
+        st.info("조회된 데이터가 없습니다. 다른 날짜나 지역을 선택해보세요.")
+else:
+    st.info("좌측 사이드바에서 조회 조건을 선택한 후 '실거래가 조회' 버튼을 눌러주세요.")

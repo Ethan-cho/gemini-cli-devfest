@@ -1,0 +1,7 @@
+API-KEY.dat
+.DS_Store
+.vscode/
+.venv/
+venv/
+__pycache__/
+*.pyc
